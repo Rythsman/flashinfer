@@ -221,6 +221,163 @@ Hopper kernel 在 `grid.sync()` 之后直接调用 merge：
 
 ---
 
+## 4.5 一个 work item 在 Hopper kernel 内部是如何被进一步计算的（从坐标到 tile/mainloop/merge）
+
+这一节回答两个问题：
+
+- **Plan 切出来的 work item 到底“算什么”？**
+- `kv_len_limit`（Plan 的 chunk 上限）与 Hopper kernel 里固定的 `CTA_TILE_Q/CTA_TILE_KV/NUM_STAGES` 有何区别，如何共同决定 CTA/cluster 粒度与 mainloop 行为？
+
+### 4.5.1 先区分两层概念：work item 边界 vs kernel tile 粒度
+
+**(A) `MLAPlan` 的 `kv_len_limit`：决定 work item 的 KV chunk 边界（单位：token）**
+
+Plan 会为每个 work 写入 `(kv_start, kv_end)`，并保证单个 work 覆盖的 KV 长度 `actual_len = kv_end - kv_start <= kv_len_limit`：
+
+```cpp
+// include/flashinfer/attention/scheduler.cuh::MLAPlan
+int actual_len = std::min(remaining_len, kv_len_limit);
+cluster_kv_start[cluster_idx].push_back(kv_start);
+cluster_kv_end[cluster_idx].push_back(kv_start + actual_len);
+```
+
+**(B) Hopper kernel 的 `CTA_TILE_KV = 64`：决定 work 内部 mainloop 的 KV tile 步长（单位：token）**
+
+即便一个 work 的 `(kv_start, kv_end)` 覆盖了例如 256 token，kernel 仍然会按 64 token 一块进行流水 load/compute；最后一块通过 `kv_end` 与谓词加载/屏蔽处理边界。
+
+**(C) Hopper kernel 的 `CTA_TILE_Q = 64`：决定 CTA 级别的 packed Q tile（单位：packed-q 条目）**
+
+Plan 决定 cluster_size（`num_blks_x`），从而决定一个 work 的 Q tile 宽度：
+
+- `cluster_tile_q = num_blks_x * CTA_TILE_Q`（也就是 64 或 128）
+
+而 kernel 内则由 `blockIdx.x` 决定当前 CTA 计算 `cluster_tile_q` 的哪一段。
+
+**(D) `NUM_STAGES = 2`：决定 KV 的双缓冲流水深度（性能实现），不改变 work 边界**
+
+`NUM_STAGES` 影响的是 shared memory stage 数与 producer/consumer pipeline，属于“如何更快算完一个 work”，而不是“Plan 怎么切 work”。
+
+### 4.5.2 Plan 的 cluster_size（=gridDim.x）如何与 `CTA_TILE_Q` 配合
+
+Plan 侧：
+
+- 当 `avg_packed_qo_len > 64` 时，`cluster_size = 2`（一个 cluster 内 2 个 CTA）
+- 否则 `cluster_size = 1`
+
+并写入：
+
+- `plan_info.num_blks_x = cluster_size`
+
+kernel 侧把它当作 `gridDim.x`，并恢复出“cluster 级 Q tile 宽度”：
+
+```cpp
+// include/flashinfer/attention/mla_hopper.cuh
+const uint32_t cluster_tile_q = gridDim.x * KTraits::CTA_TILE_Q;
+```
+
+每个 work 的 `packed_qo_start`（来自 plan 的 `q_start[work_idx]`）与 `blockIdx.x` 合成当前 CTA 的 packed Q 起点：
+
+```cpp
+const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * KTraits::CTA_TILE_Q;
+```
+
+因此：
+
+- **Plan 的 Q tile 粒度**：`cluster_tile_q`（64 或 128）——决定每个 work 覆盖的 packed Q 区间
+- **Kernel 的 CTA 粒度**：`CTA_TILE_Q = 64` ——决定单个 CTA 覆盖 `cluster_tile_q` 的子区间
+
+### 4.5.3 一个 work item 的坐标如何变成实际的 Q/KV 访存
+
+#### (1) packed Q -> (token, head) 的反解（为何 `q_start` 必须是 packed offset）
+
+kernel 在加载 Q、写回 O/LSE 时都会对 packed offset 做 `divmod`：
+
+- `q`：token index（沿序列维）
+- `r`：head index
+
+这就是 Plan 使用 `packed_qo_len = qo_len * num_heads` 以及把 `q_start` 记录为 packed offset 的根本原因。
+
+#### (2) paged KV 的寻址：`kv_indices` + `page_size(block_size)` + `(kv_start..kv_end)`
+
+Hopper kernel 使用 `params.block_size = uint_fastdiv(page_size)`（见 host run 装配）来把“token 索引”拆为：
+
+- `q`：第几个 page（用于索引 `kv_indices[q]` 得到真正的 page id）
+- `r`：page 内偏移（`0..page_size-1`）
+
+你能在预取 offset 的代码里看到这个 `divmod` 过程：
+
+```cpp
+// include/flashinfer/attention/mla_hopper.cuh::prefetch_offset
+block_size.divmod(packed_block_iter, q, r);
+ckv_offset = (packed_block_iter < packed_kv_bound ? indices[q] : 0) * ckv_stride_page +
+             r * ckv_stride_n + ...
+```
+
+其中：
+
+- `packed_block_iter` 的基准来自 `kv_indptr * page_size + kv_start`（见下）
+- `packed_kv_bound = kv_indptr * page_size + kv_len` 用于谓词保护
+
+#### (3) work 的 KV chunk 边界如何落到 kernel 的 KV tile 循环里
+
+Hopper kernel 对每个 work 会计算一个“KV tile index”（按 `CTA_TILE_KV` 计），并从末端向前扫描：
+
+```cpp
+uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
+int kv_tile_idx = ceil_div((... kv_end ...), CTA_TILE_KV) - 1 - (kv_start / CTA_TILE_KV);
+const uint32_t block_iter_base = kv_indptr * block_size + kv_start;
+```
+
+理解要点：
+
+- `block_iter_base` 将 work 的起点 `kv_start` 平移到了当前 request 的 paged KV 起点 `kv_indptr * page_size`
+- `kv_tile_idx` 用 `kv_end`（再考虑 causal 裁剪）确定“最后一个 tile”，然后减去 `(kv_start/CTA_TILE_KV)` 使 tile index 变成相对 work 起点的计数
+- 循环中每步处理一块 `CTA_TILE_KV=64` 的 KV token；当 tile 靠近 causal 边界或 `kv_end` 边界时使用 mask/谓词保证正确性
+
+### 4.5.4 work 内部的计算流程（高层：QK -> softmax -> PV；以及 split-KV 的 partial 写入）
+
+Hopper kernel 使用 2 个 warp-group 做流水分工（`warp_group_idx`）：
+
+- `warp_group_idx == 0`：负责 **发起 Q/KV 的异步加载**，并在另一个 warp-group 写好 `p` 后执行 **PV** 累加到 `o_frag`
+- `warp_group_idx != 0`：负责 **QK**、**mask**、**online softmax(m/d 更新)**、把 `p` 写入 shared memory，然后通过 barrier 通知 WG0 可以做 PV
+
+关键同步点是命名 barrier `kOScaleReady` 与 `kMDReady`（代码中用 `barrier_arrive/sync`）。例如，consumer 侧在完成 softmax 并把 `p` 写入 smem 后会 arrive：
+
+```cpp
+// include/flashinfer/attention/mla_hopper.cuh
+write_p_rmem_smem<KTraits>(...);
+barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
+```
+
+producer/PV 侧会等待并读取 `o_scale` 后 rescale，再做 PV：
+
+```cpp
+barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
+load_o_scale_smem<KTraits>(&smem_storage, o_scale);
+rescale_o_<KTraits>(o_scale, o_frag);
+compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
+```
+
+**split-KV（Plan 层决定）如何影响写回：**
+
+每个 work 都带有 `partial_indptr`：
+
+- `partial_indptr == -1`：该 work 覆盖完整 KV（或无需 split），直接写 `final_o/final_lse`
+- `partial_indptr >= 0`：该 work 只是一个 KV chunk，写到 `partial_o/partial_lse` 的某段
+
+kernel 写回点的选择直接依赖该字段（见 `write_o` 调用处的三元表达式）。
+
+### 4.5.5 第二阶段 merge：为何需要 `merge_*` + `partial_*`，以及它与 `partial_indptr` 的关系
+
+当存在 split-KV 时，Plan 会为每个 KV chunk 的 work 分配 `partial_indptr`，并让每个 chunk 产出一段连续的 `row_tile_size` 个 packed-q 条目的 partial。Plan 同时构造 `merge_partial_stride = row_tile_size`，这样 merge 阶段就可以对同一个 packed-q 位置沿 stride 访问所有 chunk 的 partial 结果并归约。
+
+merge 执行位置在 Hopper kernel 的末尾（`grid.sync()` 后），调用 `DevicePersistentMergeStates`，实现位于 `include/flashinfer/attention/mla.cuh`，其中：
+
+- `offset_start/len` 来自 `merge_packed_offset_start/end[cta_idx]`（决定该 CTA 负责哪一段 packed-q）
+- `partial_offset_start/end/stride` 来自 `merge_partial_*[cta_idx]`（决定从 partial 中以何种步长收集所有 chunk 的结果）
+
+---
+
 ## 5. payload 对任务划分的影响（可直接按代码推导）
 
 下面给出与实现严格一致的推导关系（变量与 `MLAPlan` 中一致）：
