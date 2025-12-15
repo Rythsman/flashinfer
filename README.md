@@ -1,240 +1,295 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/flashinfer-ai/web-data/blob/main/logo/FlashInfer-black-background.png?raw=true">
-    <img alt="FlashInfer" src="https://github.com/flashinfer-ai/web-data/blob/main/logo/FlashInfer-white-background.png?raw=true" width=55%>
-  </picture>
-</p>
-<h1 align="center">
-Kernel Library for LLM Serving
-</h1>
+## MLAPlan 任务切分与 Hopper Kernel（BatchMLAPageAttentionHopper）配合机制解析
 
-<p align="center">
-| <a href="https://flashinfer.ai"><b>Blog</b></a> | <a href="https://docs.flashinfer.ai"><b>Documentation</b></a> | <a href="https://join.slack.com/t/flashinfer/shared_invite/zt-379wct3hc-D5jR~1ZKQcU00WHsXhgvtA"><b>Slack</b></a> |  <a href="https://github.com/orgs/flashinfer-ai/discussions"><b>Discussion Forum</b></a> |
-</p>
+本文梳理 `include/flashinfer/attention/scheduler.cuh` 中 `MLAPlan` 的构造逻辑：它如何把一个 batch 的 MLA attention 拆分成 work items（任务），在不同 payload（`batch_size/qo_len/num_heads/kv_len/causal`）下任务数如何变化，以及这些调度结果如何被 `include/flashinfer/attention/mla_hopper.cuh` 的 `BatchMLAPageAttentionHopper` / `BatchMLAPageAttentionHopperKernel` 消费与执行。
 
-[![Build Status](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/badge/icon)](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/)
-[![Documentation](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml/badge.svg)](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml)
+> 目标：做到“解释能对上代码块”，并保证信息准确。
 
-FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, SparseAttention, PageAttention, Sampling, and more. FlashInfer focuses on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
+---
 
-Check our [v0.2 release blog](https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html) for new features!
+## 1. Host 侧调用链（Plan -> Run -> Hopper Kernel）
 
-The core features of FlashInfer include:
+### 1.1 Plan 调用点
 
-1. **Efficient Sparse/Dense Attention Kernels**: Efficient single/batch attention for sparse(paged)/dense KV-storage on CUDA Cores and Tensor Cores (both FA2 & FA3) templates. The vector-sparse attention can achieve 90% of the bandwidth of dense kernels with same problem size.
-2. **Load-Balanced Scheduling**: FlashInfer decouples `plan`/`run` stage of attention computation where we schedule the computation of variable-length inputs in `plan` stage to alleviate load-imbalance issue.
-3. **Memory Efficiency**: FlashInfer offers [Cascade Attention](https://docs.flashinfer.ai/api/cascade.html#flashinfer.cascade.MultiLevelCascadeAttentionWrapper) for hierarchical KV-Cache, and implements Head-Query fusion for accelerating Grouped-Query Attention, and efficient kernels for low-precision attention and fused-RoPE attention for compressed KV-Cache.
-4. **Customizable Attention**: Bring your own attention variants through JIT-compilation.
-5. **CUDAGraph and torch.compile Compatibility**: FlashInfer kernels can be captured by CUDAGraphs and torch.compile for low-latency inference.
-6. **Efficient LLM-specific Operators**: High-Performance [fused kernel for Top-P, Top-K/Min-P sampling](https://docs.flashinfer.ai/api/sampling.html) without the need to sorting.
+`MLAPlan` 在 Host 侧的主要调用入口（SM90/Hopper 版本）是：
 
-FlashInfer supports PyTorch, TVM and C++ (header-only) APIs, and can be easily integrated into existing projects.
+- `csrc/batch_mla_sm90_plan.cu::BatchMLAPagedAttentionSM90Plan`
+  - 直接调用 `MLAPlan(...)` 并返回 `plan_info.ToVector()`
 
-## News
+对应代码：
 
-- [Mar 10, 2025] [Blog Post](https://flashinfer.ai/2025/03/10/sampling.html) Sorting-Free GPU Kernels for LLM Sampling, which explains the design of sampling kernels in FlashInfer.
-- [Mar 1, 2025] Checkout flashinfer's [intra-kernel profiler](https://github.com/flashinfer-ai/flashinfer/tree/main/profiler) for visualizing the timeline of each threadblock in GPU kernels.
-- [Dec 16, 2024] [Blog Post](https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html) FlashInfer 0.2 - Efficient and Customizable Kernels for LLM Inference Serving
-- [Sept 2024] We've launched a [Slack](https://join.slack.com/t/flashinfer/shared_invite/zt-2r93kj2aq-wZnC2n_Z2~mf73N5qnVGGA) workspace for Flashinfer users and developers. Join us for timely support, discussions, updates and knowledge sharing!
-- [Jan 31, 2024] [Blog Post](https://flashinfer.ai/2024/01/08/cascade-inference.html) Cascade Inference: Memory-Efficient Shared Prefix Batch Decoding
-- [Jan 31, 2024] [Blog Post](https://flashinfer.ai/2024/01/03/introduce-flashinfer.html) Accelerating Self-Attentions for LLM Serving with FlashInfer
-
-## Getting Started
-
-Using our PyTorch API is the easiest way to get started:
-
-### Install from PyPI
-
-FlashInfer is available as a Python package for Linux. Install the core package with:
-
-```bash
-pip install flashinfer-python
+```cpp
+// csrc/batch_mla_sm90_plan.cu
+cudaError_t status =
+    MLAPlan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+            int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+            int_workspace_size_in_bytes, plan_info,
+            static_cast<IdType*>(qo_indptr.data_ptr()),
+            static_cast<IdType*>(kv_indptr.data_ptr()),
+            static_cast<IdType*>(kv_len.data_ptr()),
+            batch_size, num_heads, head_dim_o, causal, stream);
 ```
 
-**Package Options:**
+非 Hopper（FA2）路径也会复用同一个 `MLAPlan`：
 
-- **flashinfer-python**: Core package that compiles/downloads kernels on first use
-- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
-- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+- `csrc/batch_mla_plan.cu::BatchMLAPagedAttentionPlan`
 
-**For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
+### 1.2 Run 装配 Params 并调用 Hopper kernel
 
-```bash
-pip install flashinfer-python flashinfer-cubin
-# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
-pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
+SM90/Hopper 路径：
+
+- `csrc/batch_mla_sm90_run.cu::BatchMLAPagedAttentionSM90Run`
+  - `MLAPlanInfo plan_info; plan_info.FromVector(plan_info_vec)`
+  - 通过 `GetPtrFromBaseOffset` 把 `plan_info.*_offset` 对应的数组指针装配到 `Params`（即 `MLAParams`）里
+  - 最终调用 `mla::BatchMLAPageAttentionHopper(..., plan_info.num_blks_x, plan_info.num_blks_y, stream)`
+
+对应代码片段（字段映射非常关键）：
+
+```cpp
+// csrc/batch_mla_sm90_run.cu
+params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
+params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
+params.partial_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.partial_indptr_offset);
+params.q_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_len_offset);
+params.kv_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_len_offset);
+params.q_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_start_offset);
+params.kv_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_start_offset);
+params.kv_end = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_end_offset);
+params.work_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+
+params.merge_packed_offset_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_packed_offset_start_offset);
+params.merge_packed_offset_end   = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_packed_offset_end_offset);
+params.merge_partial_packed_offset_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_packed_offset_start_offset);
+params.merge_partial_packed_offset_end   = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_packed_offset_end_offset);
+params.merge_partial_stride = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_stride_offset);
+
+params.partial_o  = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.partial_o_offset);
+params.partial_lse= GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_lse_offset);
+
+cudaError_t status = mla::BatchMLAPageAttentionHopper<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
+    params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
 ```
 
-This eliminates compilation and downloading overhead at runtime.
+非 Hopper（FA2）路径类似，但调用的是 `mla::BatchMLAPagedAttention(...)`（位于 `include/flashinfer/attention/mla.cuh`）。
 
-### Install from Source
+---
 
-Build the core package from source:
+## 2. Plan 输出的数据结构：`MLAPlanInfo` 与 `MLAParams` 的一一对应关系
 
-```bash
-git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
-cd flashinfer
-python -m pip install -v .
-```
+### 2.1 `MLAPlanInfo`（Plan 的产物）
 
-**For development**, install in editable mode:
+文件：`include/flashinfer/attention/scheduler.cuh`，结构体：`MLAPlanInfo`。
 
-```bash
-python -m pip install --no-build-isolation -e . -v
-```
+它包含两类信息：
 
-**Build optional packages:**
+- **Kernel grid 形状**：`num_blks_x`、`num_blks_y`
+- **调度数组在 workspace buffer 内的 offset**：`q_indptr_offset`、`kv_indptr_offset`、`q_start_offset`、`kv_start_offset` 等
+- **split-KV 时的 merge 描述**：`merge_*_offset` + `partial_*_offset`
 
-`flashinfer-cubin`:
+### 2.2 `MLAParams`（Kernel 的入参）
 
-```bash
-cd flashinfer-cubin
-python -m build --no-isolation --wheel
-python -m pip install dist/*.whl
-```
+文件：`include/flashinfer/attention/mla_params.cuh`，结构体：`MLAParams`。
 
-`flashinfer-jit-cache` (customize `FLASHINFER_CUDA_ARCH_LIST` for your target GPUs):
+`MLAPlanInfo` 的 offset 在 run 时会被解析成 `MLAParams` 里的指针字段。特别要注意：
 
-```bash
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
-cd flashinfer-jit-cache
-python -m build --no-isolation --wheel
-python -m pip install dist/*.whl
-```
+- `q_indptr/kv_indptr/q_len/kv_len/q_start/kv_start/kv_end/work_indptr/partial_indptr` 全部来自 int workspace
+- `partial_o/partial_lse` 来自 float workspace
+- `merge_*` 来自 int workspace
 
-For more details, see the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+---
 
-### Install Nightly Build
+## 3. `MLAPlan` 的任务切分逻辑（核心）
 
-Nightly builds are available for testing the latest features:
+### 3.1 “packed Q” 视角：`packed_qo_len = qo_len * num_heads`
 
-```bash
-# Core and cubin packages
-pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps # Install the nightly package from custom index, without installing dependencies
-pip install flashinfer-python  # Install flashinfer-python's dependencies from PyPI
-pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
-# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
-pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
-```
+`MLAPlan` 会把每个 request 的 query（`qo_len` token）和 head 维度打包成一个一维的 packed 序列：
 
-### Verify Installation
+- `packed_qo_len = qo_len * num_heads`
 
-After installation, verify that FlashInfer is correctly installed and configured:
+这是后续 Q tile 切分、以及 kernel 内 `num_heads.divmod(packed_offset, q, r)` 反解回 `(token_idx, head_idx)` 的基础。
 
-```bash
-flashinfer show-config
-```
+### 3.2 决定 cluster 形态（影响 gridDim.x）
 
-This command displays:
+`MLAPlan` 会根据 batch 的平均 packed Q 长度选择 `cluster_size`：
 
-- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
-- PyTorch and CUDA version information
-- Environment variables and artifact paths
-- Downloaded cubin status and module compilation status
+- 若 `avg_packed_qo_len > 64`：`cluster_size = 2`
+- 否则：`cluster_size = 1`
 
-### Trying it out
+并写入：
 
-Below is a minimal example of using FlashInfer's single-request decode/append/prefill attention kernels:
+- `plan_info.num_blks_x = cluster_size`
+- `plan_info.num_blks_y = num_clusters = num_sm / cluster_size`
 
-```python
-import torch
-import flashinfer
+同时：
 
-kv_len = 2048
-num_kv_heads = 32
-head_dim = 128
+- `cta_tile_q = 64`
+- `cluster_tile_q = cluster_size * cta_tile_q`（也就是 64 或 128）
 
-k = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0)
-v = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0)
+代码位置：`include/flashinfer/attention/scheduler.cuh::MLAPlan` 开头。
 
-# decode attention
+### 3.3 决定 KV chunk 上限 `kv_len_limit`（决定是否 split KV）
 
-num_qo_heads = 32
-q = torch.randn(num_qo_heads, head_dim).half().to(0)
+`MLAPlan` 会先计算所有 request 的所有 Q tile 的 **effective KV length** 总和 `total_kv_lens`：
 
-o = flashinfer.single_decode_with_kv_cache(q, k, v) # decode attention without RoPE on-the-fly
-o_rope_on_the_fly = flashinfer.single_decode_with_kv_cache(q, k, v, pos_encoding_mode="ROPE_LLAMA") # decode with LLaMA style RoPE on-the-fly
+- non-causal：`effective_kv_len = kv_len`
+- causal：`effective_kv_len = packed_causal_kv_end(...)`（越靠后的 Q tile，effective KV 往往越大）
 
-# append attention
-append_qo_len = 128
-q = torch.randn(append_qo_len, num_qo_heads, head_dim).half().to(0) # append attention, the last 128 tokens in the KV-Cache are the new tokens
-o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True) # append attention without RoPE on-the-fly, apply causal mask
-o_rope_on_the_fly = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, pos_encoding_mode="ROPE_LLAMA") # append attention with LLaMA style RoPE on-the-fly, apply causal mask
+然后用 `ceil_div(total_kv_lens, num_clusters)` 得到每个 cluster 平均负载，再通过一个分段函数 `f()` 离散化：
 
-# prefill attention
-qo_len = 2048
-q = torch.randn(qo_len, num_qo_heads, head_dim).half().to(0) # prefill attention
-o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False) # prefill attention without RoPE on-the-fly, do not apply causal mask
-```
+- `x<=8 -> 32`
+- `x<=16 -> 64`
+- `x<=32 -> 128`
+- `x<=64 -> 192`
+- 否则对齐到 `256` 倍数
 
-Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode/append/prefill kernels and shared-prefix cascading kernels.
+最终：
 
-## API Logging
+- `kv_len_limit = f(max(ceil_div(total_kv_lens, num_clusters), 1))`
 
-FlashInfer provides comprehensive API logging for debugging. Enable it using environment variables:
+**重要结论**：
 
-```bash
-# Enable logging (levels: 0=off (default), 1=basic, 3=detailed, 5=statistics)
-export FLASHINFER_LOGLEVEL=3
+- GPU 的 `num_sm` 越大、`num_clusters` 越大，平均负载越小，`kv_len_limit` 越可能落在较小档位，从而更容易触发 split-KV。
 
-# Set log destination (stdout (default), stderr, or file path)
-export FLASHINFER_LOGDEST=stdout
-```
+### 3.4 生成 work items（Q tile × KV chunk），并用 heap 做 load balance
 
-For detailed information about logging levels, configuration, and advanced features, see [Logging](https://docs.flashinfer.ai/logging.html) in our documentation.
+对每个 request：
 
-## Custom Attention Variants
+1. 将 packed Q 按 `cluster_tile_q` 切成 `num_qo_tiles = ceil(packed_qo_len / cluster_tile_q)`
+2. 对每个 Q tile：
+   - 计算 `remaining_len`（causal / non-causal 不同）
+   - 若 `remaining_len > kv_len_limit` 则 split KV：
+     - `num_kv_chunks = ceil(remaining_len / kv_len_limit)`
+     - 每个 KV chunk 生成一个 work
+     - 每个 work 记录：`q_indptr/kv_indptr/q_len/kv_len/q_start/kv_start/kv_end`
+     - 并为该 work 分配 `partial_indptr`（指向 `partial_o/partial_lse` 的写入位置）
+   - 否则：仅生成 1 个 work，并设置 `partial_indptr = -1` 表示直接写 final
+3. 每生成一个 work，用 `MinHeap` 将它分配给当前累计 cost 最小的 cluster（对应 `blockIdx.y`）
 
-Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
+代价函数位于同文件：
 
-## GPU and CUDA Support
+- `include/flashinfer/attention/scheduler.cuh::cost_function(int qo_len, int kv_len)`
 
-FlashInfer currently provides support for NVIDIA SM architectures 75 and higher and beta support for 103, 110, 120, and 121.
+---
 
-**Supported CUDA Versions:** 12.6, 12.8, 13.0, 13.1
+## 4. Hopper kernel 如何消费 `MLAPlan` 的调度结果
 
-> **Note:** FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
+### 4.1 遍历 work：`work_indptr[blockIdx.y]..work_indptr[blockIdx.y+1]`
 
-## Adoption
+文件：`include/flashinfer/attention/mla_hopper.cuh`，kernel：`BatchMLAPageAttentionHopperKernel`。
 
-We are thrilled to share that FlashInfer is being adopted by many cutting-edge projects, including but not limited to:
+它用 `blockIdx.y` 作为 cluster id，从 `work_indptr` 拿到该 cluster 的 work 区间：
 
-- [MLC-LLM](https://github.com/mlc-ai/mlc-llm)
-- [Punica](https://github.com/punica-ai/punica)
-- [SGLang](https://github.com/sgl-project/sglang)
-- [ScaleLLM](https://github.com/vectorch-ai/ScaleLLM)
-- [vLLM](https://github.com/vllm-project/vllm)
-- [TGI](https://github.com/huggingface/text-generation-inference)
-- [lorax](https://github.com/predibase/lorax)
-- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
-- [LightLLM](https://github.com/ModelTC/lightllm)
-
-## Acknowledgement
-
-FlashInfer is inspired by [FlashAttention 1&2](https://github.com/dao-AILab/flash-attention/), [vLLM](https://github.com/vllm-project/vllm), [stream-K](https://arxiv.org/abs/2301.03598), [cutlass](https://github.com/nvidia/cutlass) and [AITemplate](https://github.com/facebookincubator/AITemplate) projects.
-
-## Citation
-
-If you find FlashInfer helpful in your project or research, please consider citing our [paper](https://arxiv.org/abs/2501.01005):
-
-```bibtex
-@article{ye2025flashinfer,
-    title = {FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving},
-    author = {
-      Ye, Zihao and
-      Chen, Lequn and
-      Lai, Ruihang and
-      Lin, Wuwei and
-      Zhang, Yineng and
-      Wang, Stephanie and
-      Chen, Tianqi and
-      Kasikci, Baris and
-      Grover, Vinod and
-      Krishnamurthy, Arvind and
-      Ceze, Luis
-    },
-    journal = {arXiv preprint arXiv:2501.01005},
-    year = {2025},
-    url = {https://arxiv.org/abs/2501.01005}
+```cpp
+for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1]; ++work_idx) {
+  auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end] =
+      get_block_coord(params, work_idx);
+  // ...
 }
 ```
+
+其中 `get_block_coord` 只是把 `params` 里的数组按固定顺序取出来。
+
+### 4.2 为什么 `q_start` 必须是 packed offset
+
+Hopper kernel 在加载 Q、写回 O/LSE 时都会把 packed offset 通过 `num_heads.divmod(...)` 反解为 `(token_idx, head_idx)`。
+
+因此 `MLAPlan` 存储的 `q_start` 是“packed Q 起点”，并在 kernel 内与 `blockIdx.x * CTA_TILE_Q` 合成 CTA 负责的 packed Q 范围：
+
+- `qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q`
+
+这与 plan 中：
+
+- `cluster_q_start = qo_tile_idx * cluster_tile_q`
+
+保持一致。
+
+### 4.3 split KV 时写 partial；否则写 final
+
+Hopper kernel 的 `write_o` 调用点用 `partial_indptr == -1` 作为是否 split-KV 的判据：
+
+- `partial_indptr == -1`：`partial_o/partial_lse` 传 `nullptr`，直接写 `final_o/final_lse`
+- `partial_indptr >= 0`：写 `partial_o/partial_lse`，等待最后 merge
+
+### 4.4 第二阶段 merge：`DevicePersistentMergeStates` 消费 `merge_*`
+
+Hopper kernel 在 `grid.sync()` 之后直接调用 merge：
+
+- `DevicePersistentMergeStates(merge_packed_offset_start, merge_packed_offset_end, merge_partial_packed_offset_start, merge_partial_packed_offset_end, merge_partial_stride, ...)`
+
+该函数实现位于 `include/flashinfer/attention/mla.cuh`。
+
+`merge_*` 描述了“某个 CTA（用 `cta_idx = gridDim.x * blockIdx.y + blockIdx.x` 编码）负责把哪一段 packed Q 的 partial 结果跨 stride 归约回 final”。
+
+---
+
+## 5. payload 对任务划分的影响（可直接按代码推导）
+
+下面给出与实现严格一致的推导关系（变量与 `MLAPlan` 中一致）：
+
+- **packed Q 长度**：`packed_qo_len_i = qo_len_i * num_heads`
+- **cluster_tile_q**：`cluster_tile_q = cluster_size * 64`，其中 `cluster_size = 2 if avg_packed_qo_len>64 else 1`
+- **Q tile 数**：`num_qo_tiles_i = ceil(packed_qo_len_i / cluster_tile_q)`
+- **KV split 判据（每个 Q tile）**：`split_kv = remaining_len > kv_len_limit`
+- **KV chunk 数**：`num_kv_chunks = ceil(remaining_len / kv_len_limit)`
+- **work item 数（近似）**：`sum_i sum_{q_tile} (split? num_kv_chunks : 1)`
+
+其中 `kv_len_limit` 由 `total_kv_lens/num_clusters` 推导，并被 `f()` 离散化，所以它同时受：
+
+- GPU 的 `num_sm`
+- `cluster_size`（由 `avg_packed_qo_len` 决定）
+- `batch_size/qo_len/num_heads/kv_len/causal`
+
+共同影响。
+
+---
+
+## 6. 一个与常见 decode 配置一致的示例（帮助直觉理解）
+
+若 decode 场景：
+
+- `qo_len = 1`
+- `num_heads = 64`（例如 DCP 后 local heads 为 64）
+- `kv_len = 8192`
+
+则：
+
+- `packed_qo_len = 1 * 64 = 64`
+- `avg_packed_qo_len = 64`（batch=1 时就是它）
+- `cluster_size = 1`，`cluster_tile_q = 64`，所以每个 request 的 Q tile 数：`ceil(64/64)=1`
+
+若 GPU `num_sm` 较大导致 `num_clusters` 较大，则 `ceil(total_kv_lens/num_clusters)` 可能较小，经过 `f()` 离散后 `kv_len_limit` 可能变为 `256`（或更小档位），从而：
+
+- `num_kv_chunks = ceil(8192 / 256) = 32`
+- 该 request（唯一 Q tile）会产生约 32 个 work items（每个 work 覆盖一个 KV chunk），这些 work 会被 `MinHeap` 尽量均匀分配到不同的 `blockIdx.y`。
+
+这解释了“batch 很小、KV 很长、GPU 很大”时更容易触发 split-KV 并出现大量 work 的现象。
+
+---
+
+## 7. 你可以从哪些字段直接观察“切分结果”
+
+若要在运行时验证某个 payload 的任务划分，可以关注这些数组（都由 `MLAPlan` 写入 int workspace）：
+
+- `work_indptr`：每个 `blockIdx.y` 对应的 work 区间
+- `q_indptr/kv_indptr/q_len/kv_len/q_start/kv_start/kv_end`：每个 work 的坐标
+- `partial_indptr`：是否 split-KV，以及 partial 写入位置
+- `merge_packed_offset_* / merge_partial_*`：merge 阶段每个 CTA 的归约范围与 stride
+
+---
+
+## 8. 相关文件索引
+
+- `include/flashinfer/attention/scheduler.cuh`
+  - `MLAPlanInfo`
+  - `MLAPlan(...)`
+  - `cost_function(...)`
+- `include/flashinfer/attention/mla_params.cuh`
+  - `MLAParams`
+- `include/flashinfer/attention/mla_hopper.cuh`
+  - `BatchMLAPageAttentionHopperKernel`
+  - `BatchMLAPageAttentionHopper(...)`
+- `include/flashinfer/attention/mla.cuh`
+  - `DevicePersistentMergeStates(...)`
+- `csrc/batch_mla_sm90_plan.cu` / `csrc/batch_mla_sm90_run.cu`
+  - Plan/Run 的 host 侧装配路径（SM90/Hopper）
+- `csrc/batch_mla_plan.cu` / `csrc/batch_mla_run.cu`
+  - 非 Hopper（FA2）路径的装配方式（同样使用 `MLAPlan`）
