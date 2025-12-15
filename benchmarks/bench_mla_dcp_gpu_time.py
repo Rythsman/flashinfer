@@ -299,6 +299,99 @@ def _make_dcp_run_fn(
     return _run_once
 
 
+def _build_single_dcp_wrapper_and_buffers(
+    cfg: BenchmarkConfig,
+    device: torch.device,
+    q_indptr: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    out_template: torch.Tensor,
+    lse_template: torch.Tensor,
+    return_lse: bool,
+    dcp_rank: int,
+) -> Tuple[
+    flashinfer.mla.BatchMLAPagedAttentionWrapper, torch.Tensor, Optional[torch.Tensor]
+]:
+    """Create a single wrapper for one DCP rank, plan once, and pre-allocate out/lse."""
+    if dcp_rank < 0 or dcp_rank >= cfg.dcp_size:
+        raise ValueError(f"dcp_rank must be in [0, {cfg.dcp_size}), got {dcp_rank}")
+
+    num_local_heads = 128 // cfg.tp_size * cfg.dcp_size
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=cfg.backend)
+
+    kv_indptr_cpu, kv_indices_cpu, local_kv_lens_cpu = _build_dcp_indices(
+        kv_lens_cpu, cfg.dcp_size, dcp_rank
+    )
+
+    kv_indptr = kv_indptr_cpu.to(device=device, non_blocking=True)
+    kv_indices = kv_indices_cpu.to(device=device, non_blocking=True)
+    local_kv_lens = local_kv_lens_cpu.to(device=device, non_blocking=True)
+
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        local_kv_lens,
+        num_local_heads,
+        cfg.head_dim_ckv,
+        cfg.head_dim_kpe,
+        cfg.page_size,
+        False,  # causal
+        cfg.sm_scale,
+        q_nope.dtype,
+        ckv_cache.dtype,
+    )
+
+    out = torch.empty_like(out_template)
+    if return_lse:
+        lse = torch.empty_like(lse_template)
+    else:
+        lse = None
+
+    return wrapper, out, lse
+
+
+def _make_single_run_fn(
+    wrapper: flashinfer.mla.BatchMLAPagedAttentionWrapper,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor],
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    return_lse: bool,
+) -> Callable[[], None]:
+    """Create a callable that runs exactly one rank once (measured unit)."""
+
+    def _run_once() -> None:
+        if return_lse:
+            wrapper.run(
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                out=out,
+                lse=lse,
+                return_lse=True,
+            )
+        else:
+            wrapper.run(
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                out=out,
+                return_lse=False,
+            )
+
+    return _run_once
+
+
 def _stats_ms(ms_list: Sequence[float]) -> str:
     arr = np.asarray(ms_list, dtype=np.float64)
     p50 = float(np.percentile(arr, 50))
@@ -315,6 +408,12 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=8192)
     parser.add_argument("--tp-size", type=int, default=16)
     parser.add_argument("--dcp-size", type=int, default=8)
+    parser.add_argument(
+        "--dcp-rank",
+        type=int,
+        default=0,
+        help="Which single DCP rank to benchmark (0 <= rank < dcp_size).",
+    )
     parser.add_argument("--head-dim-ckv", type=int, default=512)
     parser.add_argument("--head-dim-kpe", type=int, default=64)
     parser.add_argument("--page-size", type=int, default=1)
@@ -363,7 +462,7 @@ def main() -> None:
         lse_template,
     ) = _make_inputs(cfg, device)
 
-    wrappers, outs, lses = _build_dcp_wrappers_and_buffers(
+    wrapper, out, lse = _build_single_dcp_wrapper_and_buffers(
         cfg,
         device,
         q_indptr,
@@ -375,12 +474,13 @@ def main() -> None:
         out_template,
         lse_template,
         return_lse=args.return_lse,
+        dcp_rank=args.dcp_rank,
     )
 
-    run_once = _make_dcp_run_fn(
-        wrappers,
-        outs,
-        lses,
+    run_once = _make_single_run_fn(
+        wrapper,
+        out,
+        lse,
         q_nope,
         q_pe,
         ckv_cache,
@@ -408,6 +508,7 @@ def main() -> None:
         "Config: "
         f"backend={cfg.backend}, dtype={args.dtype}, batch_size={cfg.batch_size}, seq_len={cfg.seq_len}, "
         f"tp_size={cfg.tp_size}, dcp_size={cfg.dcp_size}, num_local_heads={num_local_heads}, "
+        f"dcp_rank={args.dcp_rank}, "
         f"head_dim_ckv={cfg.head_dim_ckv}, head_dim_kpe={cfg.head_dim_kpe}, page_size={cfg.page_size}, "
         f"return_lse={args.return_lse}"
     )
